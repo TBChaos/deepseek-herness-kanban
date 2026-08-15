@@ -1,0 +1,13 @@
+# Example: profile overlay for deepseek-herness-kanban.
+# Copy this section into your profile's cordis.patch.yml and tune the knobs.
+
+- id: herness-kanban
+  name: 'deepseek-herness-kanban'
+  config:
+    maxConcurrent: 5
+    heartbeatTimeoutMs: 1800000
+    worktreeBaseDir: null
+    dispatchProvider: null
+    dispatchModel: null
+    dispatchMaxTokens: null
+

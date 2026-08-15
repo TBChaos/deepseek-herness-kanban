@@ -1,0 +1,16 @@
+# deepseek-herness-kanban — bundle patch.
+#
+# Installed profiles compose this layer automatically because package.json
+# declares dsh.bundle.patch. Adjust per-profile knobs in your own
+# cordis.patch.yml; the last write per row wins.
+
+- insert:
+    - id: herness-kanban
+      name: 'deepseek-herness-kanban'
+      config:
+        # Max concurrently executing tasks (NF-06: ≥ 5).
+        maxConcurrent: 5
+        # Stop a run with no heartbeat signal after this many milliseconds (NF-10).
+        heartbeatTimeoutMs: 1800000
+        # Where task worktrees are created, default "<repoPath>-<taskId>".
+        worktreeBaseDir: null

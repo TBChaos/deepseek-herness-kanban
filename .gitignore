@@ -1,0 +1,24 @@
+# dependencies
+node_modules/
+
+# build output
+lib/
+client/index.js
+client/index.d.ts
+client/*.map
+
+# logs / temp
+*.log
+.DS_Store
+.tmp/
+
+# test artifacts
+coverage/
+tests/.tmp/
+
+# editor
+.vscode/
+.idea/
+
+# dsh runtime
+.dsh/
