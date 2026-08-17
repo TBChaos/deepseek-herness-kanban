@@ -89,11 +89,14 @@ export type EventType =
   | 'stopped'
   | 'merged'
   | 'reverted'
+  | 'rejected'
   | 'commented'
   | 'description_updated'
   | 'review_requested'
   | 'review_approved'
   | 'review_rejected'
+  | 'discussion_started'
+  | 'recovered'
 
 export interface Event {
   id: string

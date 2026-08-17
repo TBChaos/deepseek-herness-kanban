@@ -9,6 +9,7 @@ client/*.map
 
 # logs / temp
 *.log
+*.tgz
 .DS_Store
 .tmp/
 

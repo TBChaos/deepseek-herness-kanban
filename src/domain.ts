@@ -55,8 +55,8 @@ const eventSchema = z.object({
   type: z.enum([
     'created', 'column_changed', 'assigned', 'blocked', 'unblocked', 'scheduled',
     'dispatched', 'running', 'progress', 'completed', 'failed', 'stopped',
-    'merged', 'reverted', 'commented', 'description_updated', 'review_requested',
-    'review_approved', 'review_rejected',
+    'merged', 'reverted', 'rejected', 'commented', 'description_updated', 'review_requested',
+    'review_approved', 'review_rejected', 'discussion_started', 'recovered',
   ]),
   data: z.record(z.string(), z.unknown()),
   timestamp: z.number(),

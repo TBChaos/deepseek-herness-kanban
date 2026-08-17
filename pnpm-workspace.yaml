@@ -1,0 +1,4 @@
+# pnpm 11 reads build approvals from here (the package.json "pnpm" field is ignored).
+# esbuild's postinstall links the platform binary; required by vite/tsx builds.
+allowBuilds:
+  esbuild: true

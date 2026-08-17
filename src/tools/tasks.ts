@@ -4,7 +4,7 @@
  * touches a card records an event (TM-10).
  */
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { COLUMN_IDS, PRIORITY_BADGE } from '../types.js'
+import { COLUMN_IDS, PRIORITY_BADGE, type ColumnId, type Priority } from '../types.js'
 import type { KanbanService } from '../service.js'
 
 const taskDigest = {
@@ -29,26 +29,47 @@ const taskDigest = {
   },
 } as const
 
-function digestOf(service: KanbanService, taskId: string) {
+interface TaskDigest {
+  id: string
+  boardId: string
+  title: string
+  columnId: ColumnId
+  priority: Priority
+  assignee?: string
+  isBlocked?: boolean
+  sessionId?: string
+  threadId?: string
+  attempts: number
+  comments: number
+  latestAttemptStatus?: string
+  latestError?: string
+  createdAt: number
+  updatedAt: number
+}
+
+function digestOf(service: KanbanService, taskId: string): TaskDigest {
   const task = service.getTask(taskId)
   const last = task.attempts[task.attempts.length - 1]
-  return {
+  // Only defined values may be included: `undefined` properties make the
+  // tool result fail the harness's lossless-JSON snapshot validation.
+  const digest: TaskDigest = {
     id: task.id,
     boardId: task.boardId,
     title: task.title,
     columnId: task.columnId,
     priority: task.priority,
-    assignee: task.assignee,
-    isBlocked: task.isBlocked,
-    sessionId: task.sessionId,
-    threadId: task.threadId,
     attempts: task.attempts.length,
     comments: task.comments.length,
-    latestAttemptStatus: last?.status,
-    latestError: last?.error,
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
   }
+  if (task.assignee !== undefined) digest.assignee = task.assignee
+  if (task.isBlocked !== undefined) digest.isBlocked = task.isBlocked
+  if (task.sessionId !== undefined) digest.sessionId = task.sessionId
+  if (task.threadId !== undefined) digest.threadId = task.threadId
+  if (last?.status !== undefined) digest.latestAttemptStatus = last.status
+  if (last?.error !== undefined) digest.latestError = last.error
+  return digest
 }
 
 export function registerTaskTools(ctx: { tools: { register(definition: unknown): () => void } }, service: KanbanService) {
@@ -127,6 +148,9 @@ export function registerTaskTools(ctx: { tools: { register(definition: unknown):
               threadId: { type: 'string' },
               parentTaskId: { type: 'string' },
               subtaskIds: { type: 'array', items: { type: 'string' } },
+              createdAt: { type: 'integer', required: true },
+              updatedAt: { type: 'integer', required: true },
+              completedAt: { type: 'integer' },
               comments: {
                 type: 'array',
                 required: true,
@@ -135,6 +159,7 @@ export function registerTaskTools(ctx: { tools: { register(definition: unknown):
                   additionalProperties: false,
                   properties: {
                     id: { type: 'string', required: true },
+                    taskId: { type: 'string', required: true },
                     author: { type: 'string', required: true },
                     content: { type: 'string', required: true },
                     createdAt: { type: 'integer', required: true },
@@ -151,6 +176,7 @@ export function registerTaskTools(ctx: { tools: { register(definition: unknown):
                   additionalProperties: false,
                   properties: {
                     id: { type: 'string', required: true },
+                    taskId: { type: 'string', required: true },
                     status: { type: 'string', required: true, enum: ['pending', 'running', 'success', 'failed', 'stopped'] },
                     sessionId: { type: 'string' },
                     branchName: { type: 'string' },
@@ -173,6 +199,7 @@ export function registerTaskTools(ctx: { tools: { register(definition: unknown):
                   additionalProperties: false,
                   properties: {
                     id: { type: 'string', required: true },
+                    taskId: { type: 'string', required: true },
                     type: { type: 'string', required: true },
                     data: { type: 'json' },
                     timestamp: { type: 'integer', required: true },
@@ -308,7 +335,7 @@ export function registerTaskTools(ctx: { tools: { register(definition: unknown):
 
   ctx.tools.register(defineTool({
     name: 'herness_kanban_move_task',
-    description: 'Move a card to a column: todo | doing | review | done. Dispatched execution flows automatically (todo → doing → review); moving a card to done marks it complete and activates its subtasks (TA-03).',
+    description: 'Move a card to a column: todo | doing | review | done. The 4-column workflow is a state machine (Req 2): only todo→done and done→todo are free manual moves. doing→todo is allowed (abandon). Everything else goes through its lifecycle entry point: todo→doing via dispatch_task, doing→review automatically after success, review→done via merge_task, review→todo via revert_task. Moving a card to done marks it complete and activates its subtasks (TA-03).',
     parameters: {
       taskId: { type: 'string', required: true, description: 'Task id.' },
       columnId: { type: 'string', required: true, enum: [...COLUMN_IDS], description: 'Target column.' },
@@ -369,5 +396,26 @@ export function registerTaskTools(ctx: { tools: { register(definition: unknown):
       return digestOf(service, task.id)
     },
     presentCall: (args) => ({ card: 'generic', title: 'Update description', kind: 'other', rawInput: { taskId: args.taskId } }),
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'herness_kanban_discuss_task',
+    description: '💬 Start a dedicated refinement conversation for a todo task (Req 3). A new DSH session is spawned whose context contains ONLY this card (description, comments, events, attempts); the user continues the discussion in that session (shown under the project workspace in the GUI) to sharpen the requirements. The card must be in todo. Call this when the user wants to refine a task\'s requirements before dispatching it.',
+    parameters: {
+      taskId: { type: 'string', required: true, description: 'Task id (must be in todo).' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          taskId: { type: 'string', required: true },
+          sessionId: { type: 'string', required: true },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: 'Refinement conversation started for ' + value.taskId + ' — session ' + value.sessionId + ' (context: this card only).' }],
+    },
+    execute: async (args) => service.startDiscussion(String(args.taskId)),
+    presentCall: (args) => ({ card: 'generic', title: 'Discuss task', kind: 'other', rawInput: { taskId: args.taskId } }),
   }))
 }

@@ -6,6 +6,9 @@
 > Cards accumulate the whole conversation context of a feature, and a single tool
 > turns any chat into a batch of tasks.
 
+[![npm](https://img.shields.io/npm/v/deepseek-herness-kanban)](https://www.npmjs.com/package/deepseek-herness-kanban)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+
 [中文文档](./README.zh.md) · [Docs](./docs/README.md) · [MIT](./LICENSE)
 
 ## Highlights
@@ -48,12 +51,12 @@
 ## Install
 
 ```sh
-# from the npm registry (when published)
+# from the npm registry
 dsh plugin --profile web add deepseek-herness-kanban
 
 # from a local checkout / tarball
 dsh plugin --profile web add link:/path/to/deepseek-herness-kanban
-dsh plugin --profile web add ./deepseek-herness-kanban-0.1.0.tgz
+dsh plugin --profile web add ./deepseek-herness-kanban-<version>.tgz
 ```
 
 Then open the DSH Web GUI → click **📋 看板** in the sidebar.
@@ -84,7 +87,7 @@ config key is documented there and in [docs/configuration.md](./docs/configurati
 ```
 ┌─ DSH host process ────────────────────────────────────────────┐
 │  Host plane            │  Client plane                        │
-│  • KanbanStore         │  • 17 herness_kanban_* agent tools   │
+│  • KanbanStore         │  • 19 herness_kanban_* agent tools   │
 │    (storage domain)    │  • herness-kanban skill              │
 │  • GitService          │  • 📋 看板 tab (React, slot system)  │
 │  • SchedulerService    │  • POST /herness-kanban/rpc          │
@@ -93,14 +96,14 @@ config key is documented there and in [docs/configuration.md](./docs/configurati
 
 Read the full story in [docs/architecture.md](./docs/architecture.md).
 
-## The 17 agent tools
+## The 19 agent tools
 
 Boards: `list_boards`, `create_board`, `delete_board` · Tasks:
 `list_tasks`, `get_task`, `create_task`, `update_task`, `delete_task`,
-`move_task`, `add_comment`, `update_description` · Execution:
-`dispatch_task`, `stop_task`, `merge_task`, `get_diff`, `revert_task` ·
-Decomposition: `parse_conversation` — all prefixed `herness_kanban_`, see
-[docs/tools.md](./docs/tools.md).
+`move_task`, `add_comment`, `update_description`, `discuss_task` ·
+Execution: `dispatch_task`, `stop_task`, `merge_task`, `get_diff`,
+`reject_task`, `revert_task` · Decomposition: `parse_conversation` — all
+prefixed `herness_kanban_`, see [docs/tools.md](./docs/tools.md).
 
 ## License
 

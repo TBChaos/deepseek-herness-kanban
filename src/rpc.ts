@@ -81,11 +81,23 @@ export function registerRpcHandlers(rpc: RpcRegistry, service: KanbanService): v
   handle('tasks.move', async (args) => service.moveTask(String(args.taskId), String(args.columnId) as 'todo'|'doing'|'review'|'done'))
   handle('tasks.comment', async (args) => service.addComment(String(args.taskId), String(args.content ?? ''), String(args.author ?? 'user'), typeof args.filePath === 'string' ? { filePath: args.filePath, lineNumber: typeof args.lineNumber === 'number' ? args.lineNumber : undefined } : undefined))
   handle('tasks.updateDescription', async (args) => service.updateDescription(String(args.taskId), String(args.description ?? ''), String(args.author ?? 'user')))
+  handle('tasks.appendDetail', async (args) => service.appendDetail(String(args.taskId), String(args.content ?? ''), String(args.author ?? 'user')))
+  handle('task.discuss', async (args) => service.startDiscussion(String(args.taskId)))
 
   handle('exec.dispatch', async (args) => {
-    const attempt = await service.dispatch(String(args.taskId))
+    const rawRunner = typeof args.runner === 'object' && args.runner !== null ? args.runner as Record<string, unknown> : {}
+    const runner = {
+      ...(typeof rawRunner.mode === 'string' ? { mode: rawRunner.mode as 'agent' | 'api' } : {}),
+      ...(typeof rawRunner.agentPreset === 'string' ? { agentPreset: rawRunner.agentPreset } : {}),
+      ...(typeof rawRunner.provider === 'string' ? { provider: rawRunner.provider } : {}),
+      ...(typeof rawRunner.model === 'string' ? { model: rawRunner.model } : {}),
+      ...(typeof rawRunner.reasoningEffort === 'string' ? { reasoningEffort: rawRunner.reasoningEffort } : {}),
+      ...(typeof rawRunner.maxTokens === 'number' ? { maxTokens: rawRunner.maxTokens } : {}),
+    }
+    const attempt = await service.dispatch(String(args.taskId), runner)
     return { attemptId: attempt.id, status: attempt.status }
   })
+  handle('dispatch.catalog', async () => service.dispatchCatalog())
   handle('exec.stop', async (args) => {
     await service.stop(String(args.taskId))
     return { ok: true }
@@ -99,6 +111,10 @@ export function registerRpcHandlers(rpc: RpcRegistry, service: KanbanService): v
   })
   handle('review.revert', async (args) => {
     const result = await service.revertTask(String(args.taskId), String(args.reason ?? ''), String(args.author ?? 'user'))
+    return { taskId: result.task.id, commit: result.commit }
+  })
+  handle('review.reject', async (args) => {
+    const result = await service.rejectTask(String(args.taskId), String(args.reason ?? ''), String(args.author ?? 'user'))
     return { taskId: result.task.id, commit: result.commit }
   })
   handle('parse.tasks', async (args) => service.parseConversation({

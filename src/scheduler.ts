@@ -16,12 +16,25 @@ export const DEFAULT_MAX_CONCURRENT = 5
 export const DEFAULT_HEARTBEAT_TIMEOUT_MS = 30 * 60 * 1000
 export const HEARTBEAT_FILE = '.herness/heartbeat.json'
 
+export interface DispatchRunnerOptions {
+  /** 'agent' = run as a DSH agent (optionally with a preset); 'api' = direct model route without an agent preset. */
+  mode?: 'agent' | 'api'
+  /** Agent preset id (the "mode" in the UI: standard/code/minimal/cordis). */
+  agentPreset?: string
+  provider?: string
+  model?: string
+  maxTokens?: number
+  reasoningEffort?: string
+}
+
 export interface DispatchOptions {
   task: Task
   board: Board
   attempt: TaskAttempt
   worktreePath: string
   branchName: string
+  /** Per-dispatch execution options (provider/model/preset/reasoning). */
+  runner?: DispatchRunnerOptions
 }
 
 export interface SessionOutcome {
@@ -52,6 +65,8 @@ export interface SchedulerOptions {
   onSettled?: (taskId: string, outcome: SessionOutcome) => void
   /** Called when a queued run starts. */
   onStart?: (taskId: string) => void
+  /** Called after a worktree directory is destroyed so its workspace record can be cleaned up. */
+  onWorktreeRemoved?: (worktreePath: string) => void
 }
 
 interface Run {
@@ -77,10 +92,10 @@ export class SchedulerService extends EventEmitter {
   private readonly store: KanbanStore
   private readonly git: GitService
   private readonly runner: AgentRunner
-  private readonly opts: Required<Pick<SchedulerOptions, 'onProgress' | 'onSettled' | 'onStart'>>
+  private readonly opts: Required<Pick<SchedulerOptions, 'onProgress' | 'onSettled' | 'onStart' | 'onWorktreeRemoved'>>
 
   private readonly runs = new Map<string, Run>()
-  private readonly queue: Array<{ taskId: string; attemptId: string }> = []
+  private readonly queue: Array<{ taskId: string; attemptId: string; runner?: DispatchRunnerOptions }> = []
   private readonly timers = new Map<string, ReturnType<typeof setInterval>>()
   private disposed = false
 
@@ -95,6 +110,7 @@ export class SchedulerService extends EventEmitter {
       onProgress: options.onProgress ?? (() => {}),
       onSettled: options.onSettled ?? (() => {}),
       onStart: options.onStart ?? (() => {}),
+      onWorktreeRemoved: options.onWorktreeRemoved ?? (() => {}),
     }
   }
 
@@ -114,29 +130,41 @@ export class SchedulerService extends EventEmitter {
   // Dispatch (AE-01..AE-04)
   // ------------------------------------------------------------------
 
-  async dispatch(taskId: string): Promise<TaskAttempt> {
+  async dispatch(taskId: string, runner: DispatchRunnerOptions = {}): Promise<TaskAttempt> {
     if (this.disposed) throw new SchedulerError('scheduler is disposed')
     if (this.runs.has(taskId)) throw new SchedulerError('task already running: ' + taskId)
     if (this.queue.some((q) => q.taskId === taskId)) throw new SchedulerError('task already queued: ' + taskId)
     const task = this.store.getTask(taskId)
     if (task.isBlocked) throw new SchedulerError('task is blocked' + (task.blockReason ? ': ' + task.blockReason : ''))
+    // Req 2: only todo cards may be dispatched — doing/review/done have their
+    // own lifecycle (dispatch, merge/revert) and must not re-enter execution.
+    if (task.columnId !== 'todo') {
+      throw new SchedulerError('only todo tasks can be dispatched; task ' + taskId + ' is [' + task.columnId + ']')
+    }
     const board = this.store.getBoard(task.boardId)
 
     // 1. isolated worktree + branch (AE-02)
     const worktree = await this.git.createWorktree(board, task)
-    const attempt = await this.store.beginAttempt(task, undefined, worktree.path, worktree.branch)
-    await this.store.recordEvent(taskId, 'dispatched', { attemptId: attempt.id, branch: worktree.branch, worktree: worktree.path })
+    let attempt: TaskAttempt
+    try {
+      attempt = await this.store.beginAttempt(task, undefined, worktree.path, worktree.branch)
+    } catch (error) {
+      // never leave a fresh worktree behind when the attempt cannot be recorded
+      await this.git.removeWorktree(board.repoPath, worktree.path, worktree.branch, true).catch(() => undefined)
+      throw error
+    }
+    await this.store.recordEvent(taskId, 'dispatched', { attemptId: attempt.id, branch: worktree.branch, worktree: worktree.path, runner })
 
     if (this.runs.size >= this.maxConcurrent) {
-      this.queue.push({ taskId, attemptId: attempt.id })
+      this.queue.push({ taskId, attemptId: attempt.id, runner })
       await this.store.updateTask(taskId, {})
       return attempt
     }
-    void this.startRun(taskId, attempt.id)
+    void this.startRun(taskId, attempt.id, runner)
     return attempt
   }
 
-  private async startRun(taskId: string, attemptId: string): Promise<void> {
+  private async startRun(taskId: string, attemptId: string, runner: DispatchRunnerOptions = {}): Promise<void> {
     if (this.disposed) return
     const task = this.store.getTaskOrNull(taskId)
     if (!task) return
@@ -159,8 +187,13 @@ export class SchedulerService extends EventEmitter {
     await this.store.recordEvent(taskId, 'running', { attemptId })
 
     try {
-      const session = await this.runner.spawn({ task, board, attempt, worktreePath, branchName })
+      const session = await this.runner.spawn({ task, board, attempt, worktreePath, branchName, runner })
       run.session = session
+      if (run.abort.signal.aborted) {
+        // stop() raced the spawn (AE-05): the session was not stoppable yet —
+        // cancel it now so wait() settles and the worktree is cleaned up.
+        await session.stop().catch(() => undefined)
+      }
       if (session.sessionId) {
         await this.store.backend.updateTask(taskId, (current) => ({
           ...current,
@@ -186,7 +219,7 @@ export class SchedulerService extends EventEmitter {
     while (this.runs.size < this.maxConcurrent && this.queue.length > 0) {
       const next = this.queue.shift()
       if (!next) break
-      if (!this.runs.has(next.taskId)) void this.startRun(next.taskId, next.attemptId)
+      if (!this.runs.has(next.taskId)) void this.startRun(next.taskId, next.attemptId, next.runner)
     }
   }
 
@@ -204,6 +237,13 @@ export class SchedulerService extends EventEmitter {
       } catch {
         diffSummary = undefined
       }
+    } else {
+      // AE-05: a failed/stopped attempt returns the card to todo — its
+      // worktree is dead weight that would otherwise accumulate next to the
+      // repo. Destroy it (worktrees live only while a run is active or a
+      // card sits in review); only provably disposable ones are removed, so
+      // committed or dirty agent work is never destroyed silently.
+      await this.destroyAttemptWorktree(task, attemptId)
     }
     await this.store.settleAttempt(taskId, attemptId, {
       status: outcome.status,
@@ -216,6 +256,28 @@ export class SchedulerService extends EventEmitter {
     void run
   }
 
+  /**
+   * Destroy the worktree of an attempt that settled without success. The
+   * removal is best-effort and never blocks the settle: a branch with commits
+   * beyond main or uncommitted changes is kept (the re-dispatch reclaim path
+   * then surfaces it as WORKTREE_EXISTS), while clean stale slots are removed
+   * so task folders don't pile up next to the repository.
+   */
+  private async destroyAttemptWorktree(task: Task, attemptId: string): Promise<void> {
+    try {
+      const attempt = task.attempts.find((a) => a.id === attemptId)
+      if (!attempt?.worktreePath) return
+      const board = this.store.getBoard(task.boardId)
+      const branch = attempt.branchName ?? branchNameFor(task)
+      if (await this.git.branchAheadOf(board.repoPath, board.mainBranch, branch)) return
+      await this.git.removeWorktree(board.repoPath, attempt.worktreePath, branch, false)
+      this.opts.onWorktreeRemoved(attempt.worktreePath)
+    } catch {
+      // leftover worktrees are reclaimed on the next dispatch
+      // (reclaimWorktreeSlot) or swept at plugin startup — never block settle.
+    }
+  }
+
   /** Stop a running attempt: cancel the session, move the task back to todo (AE-05). */
   async stop(taskId: string): Promise<void> {
     const run = this.runs.get(taskId)
@@ -223,7 +285,12 @@ export class SchedulerService extends EventEmitter {
     if (queuedIndex >= 0) {
       this.queue.splice(queuedIndex, 1)
       const task = this.store.getTaskOrNull(taskId)
-      if (task) await this.store.settleAttempt(taskId, task.attempts[task.attempts.length - 1]?.id ?? '', { status: 'stopped', summary: '取消排队' })
+      if (task) {
+        const attempt = task.attempts[task.attempts.length - 1]
+        await this.store.settleAttempt(taskId, attempt?.id ?? '', { status: 'stopped', summary: '取消排队' })
+        // the worktree was already created at dispatch time; stop the leak
+        if (attempt) await this.destroyAttemptWorktree(task, attempt.id)
+      }
       return
     }
     if (!run) throw new SchedulerError('task is not running: ' + taskId)

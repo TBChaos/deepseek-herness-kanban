@@ -20,7 +20,7 @@
 ├──────────────────────────────────────────────────────────────────┤
 │  Client 面 (client plane)                                       │
 │  ┌──────────────┐ ┌────────────────┐ ┌─────────────────────┐    │
-│  │ 📋 看板 tab  │ │ 17 个 agent 工具│ │ herness-kanban skill│    │
+│  │ 📋 看板 tab  │ │ 19 个 agent 工具│ │ herness-kanban skill│    │
 │  │ (React 槽位) │ │ (herness_      │ │ (ctx.skills)        │    │
 │  │              │ │  kanban_*)     │ │                     │    │
 │  └──────────────┘ └────────────────┘ └─────────────────────┘    │
@@ -38,7 +38,7 @@
 | `src/scheduler.ts` | 派发/排队/并发上限、心跳看门狗、定时器 | AE-01..AE-08, TA-01..TA-04, NF-06, NF-10 |
 | `src/runner.ts` | DshAgentRunner：`ctx.agents.create` 绑定 worktree 的 Session | DS-06 |
 | `src/service.ts` | 业务门面：工具与 RPC 共享同一套不变量 | — |
-| `src/tools/` | 17 个 `herness_kanban_*` 工具 | DS-01 |
+| `src/tools/` | 19 个 `herness_kanban_*` 工具 | DS-01 |
 | `src/skill.ts` | `herness-kanban` skill | DS-02 |
 | `src/rpc.ts` | HTTP RPC + SSE | DS-04 |
 | `client/src/` | 看板 UI（4 列、拖拽、抽屉、Diff 审查、Toast） | DS-03, KB-*, CR-* |
@@ -65,11 +65,11 @@
 todo ──dispatch──▶ doing ──settle success──▶ review ──merge──▶ done
   ▲                   │                          │
   │                   └── settle failed ─────────┤
-  └──────────────────── revert（驳回）────────────┘
+  └─── reject（驳回，保留代码）/ revert（回滚，撤销合并）────┘
 ```
 
-状态流转由 KanbanStore.settleAttempt / mergeTask / revertTask 统一
-驱动，每次流转写入事件时间线（TM-07），触发 SSE 通知（NF-12, NF-13）。
+状态流转由 KanbanStore.settleAttempt / mergeTask / rejectTask / revertTask
+统一驱动，每次流转写入事件时间线（TM-07），触发 SSE 通知（NF-12, NF-13）。
 
 ## 数据流（UI ↔ 宿主）
 

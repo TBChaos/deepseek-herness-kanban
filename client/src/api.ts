@@ -110,6 +110,53 @@ export interface Snapshot {
   queue: number
 }
 
+export interface DispatchRunnerOptions {
+  mode?: 'agent' | 'api'
+  agentPreset?: string
+  provider?: string
+  model?: string
+  maxTokens?: number
+  reasoningEffort?: string
+}
+
+export interface DispatchCatalogPreset {
+  id: string
+  name: string
+  description?: string
+  broken?: string
+}
+
+export interface DispatchCatalogReasoningEffort {
+  id: string
+  name: string
+  description?: string
+}
+
+export interface DispatchCatalogModel {
+  id: string
+  name: string
+  reasoningEfforts?: DispatchCatalogReasoningEffort[]
+  defaultEffort?: string
+}
+
+export interface DispatchCatalogProvider {
+  id: string
+  name: string
+  models: DispatchCatalogModel[]
+}
+
+export interface DispatchCatalog {
+  presets: DispatchCatalogPreset[]
+  providers: DispatchCatalogProvider[]
+  defaults: {
+    mode?: 'agent' | 'api'
+    agentPreset?: string
+    provider?: string
+    model?: string
+    reasoningEffort?: string
+  }
+}
+
 export interface Toast {
   id: number
   kind: 'success' | 'error' | 'info'

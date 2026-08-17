@@ -1,11 +1,11 @@
 /**
- * All 17 agent tools, prefixed herness_kanban_ (DS-01):
+ * All 19 agent tools, prefixed herness_kanban_ (DS-01):
  *
  * boards  : list_boards, create_board, delete_board                        (3)
  * tasks   : list_tasks, get_task, create_task, update_task, delete_task,
- *           move_task, add_comment, update_description                      (8)
- * exec    : dispatch_task, stop_task, get_diff, merge_task, revert_task,
- *           parse_conversation                                              (6)
+ *           move_task, add_comment, update_description, discuss_task        (9)
+ * exec    : dispatch_task, stop_task, get_diff, merge_task, reject_task,
+ *           revert_task, parse_conversation                                (7)
  */
 import type { KanbanService } from '../service.js'
 import { registerBoardTools } from './boards.js'
@@ -28,10 +28,12 @@ export const TOOL_NAMES = [
   'herness_kanban_move_task',
   'herness_kanban_add_comment',
   'herness_kanban_update_description',
+  'herness_kanban_discuss_task',
   'herness_kanban_dispatch_task',
   'herness_kanban_stop_task',
   'herness_kanban_merge_task',
   'herness_kanban_get_diff',
+  'herness_kanban_reject_task',
   'herness_kanban_revert_task',
   'herness_kanban_parse_conversation',
 ] as const

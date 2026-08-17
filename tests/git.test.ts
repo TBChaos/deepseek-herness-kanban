@@ -60,6 +60,84 @@ describe('GitService', () => {
     assert.equal(await git.branchExists(dir, wt.branch), false)
   })
 
+  it('reclaims a stale clean worktree slot on re-dispatch (AE-02)', async () => {
+    const { dir, git } = fixture()
+    await git.ensureRepo(dir, 'main')
+    writeFileSync(join(dir, 'README.md'), '# base\n')
+    await git.commitAll(dir, 'chore: base')
+
+    const board = boardFor(dir)
+    const task = taskFor('task-retry')
+    const first = await git.createWorktree(board, task)
+    assert.ok(first.path)
+
+    // Simulate a crashed run: the slot still exists but holds no work.
+    const second = await git.createWorktree(board, task)
+    assert.equal(second.branch, 'herness-task-task-retry')
+    assert.equal(second.path, first.path)
+    assert.equal(await git.branchExists(dir, second.branch), true)
+
+    await git.removeWorktree(dir, second.path, second.branch, true)
+  })
+
+  it('refuses to reclaim a dirty stale worktree (AE-02)', async () => {
+    const { dir, git } = fixture()
+    await git.ensureRepo(dir, 'main')
+    writeFileSync(join(dir, 'README.md'), '# base\n')
+    await git.commitAll(dir, 'chore: base')
+
+    const board = boardFor(dir)
+    const task = taskFor('task-dirty')
+    const wt = await git.createWorktree(board, task)
+    writeFileSync(join(wt.path, 'uncommitted.txt'), 'work in progress\n')
+
+    await assert.rejects(
+      () => git.createWorktree(board, task),
+      (err: Error) => (err as { code?: string }).code === 'WORKTREE_DIRTY',
+    )
+
+    await git.removeWorktree(dir, wt.path, wt.branch, true)
+  })
+
+  it('refuses to reclaim a stale worktree with commits beyond main (AE-02)', async () => {
+    const { dir, git } = fixture()
+    await git.ensureRepo(dir, 'main')
+    writeFileSync(join(dir, 'README.md'), '# base\n')
+    await git.commitAll(dir, 'chore: base')
+
+    const board = boardFor(dir)
+    const task = taskFor('task-committed')
+    const wt = await git.createWorktree(board, task)
+    writeFileSync(join(wt.path, 'feature.txt'), 'reviewable work\n')
+    await git.commitAll(wt.path, 'feat: feature')
+
+    await assert.rejects(
+      () => git.createWorktree(board, task),
+      (err: Error) => (err as { code?: string }).code === 'WORKTREE_EXISTS',
+    )
+
+    await git.removeWorktree(dir, wt.path, wt.branch, true)
+  })
+
+  it('reclaims an orphaned leftover directory (AE-02)', async () => {
+    const { dir, git } = fixture()
+    await git.ensureRepo(dir, 'main')
+    writeFileSync(join(dir, 'README.md'), '# base\n')
+    await git.commitAll(dir, 'chore: base')
+
+    const board = boardFor(dir)
+    const task = taskFor('task-orphan')
+    // A crashed `git worktree add` can leave an unregistered shell behind.
+    mkdirSync(dir + '-task-orphan')
+    writeFileSync(join(dir + '-task-orphan', '.git'), 'gitdir: ' + join(dir, '.git') + '/worktrees/ghost\n')
+
+    const wt = await git.createWorktree(board, task)
+    assert.equal(wt.branch, 'herness-task-task-orphan')
+    assert.equal(await git.branchExists(dir, wt.branch), true)
+
+    await git.removeWorktree(dir, wt.path, wt.branch, true)
+  })
+
   it('merges --no-ff and reverts (CR-03, CR-04)', async () => {
     const { dir, git } = fixture()
     await git.ensureRepo(dir, 'main')

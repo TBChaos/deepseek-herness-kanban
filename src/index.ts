@@ -25,7 +25,7 @@ import { registerSkill } from './skill.js'
 import { createRpcHttpHandler, createRpcRegistry, createSseHandler, registerRpcHandlers, type RpcRegistry } from './rpc.js'
 
 export const name = 'deepseek-herness-kanban'
-export const inject = ['tools', 'storageDomain', 'skills']
+export const inject = ['tools', 'storageDomain', 'skills', 'agents', 'llm', 'sessions', 'agentDefaultModel', 'agentPresets']
 
 export interface Config {
   /** Max concurrently executing tasks (NF-06). Default 5. */
@@ -38,6 +38,10 @@ export interface Config {
   dispatchProvider: string | null
   dispatchModel: string | null
   dispatchMaxTokens: number | null
+  /** Default agent preset (mode) for dispatched sessions; null = no preset. */
+  dispatchAgentPreset: string | null
+  /** Default reasoning effort for dispatched sessions; null = provider/default. */
+  dispatchReasoningEffort: string | null
 }
 
 export const Config = z.object({
@@ -47,6 +51,8 @@ export const Config = z.object({
   dispatchProvider: z.union([z.string(), z.const(null)]).default(null),
   dispatchModel: z.union([z.string(), z.const(null)]).default(null),
   dispatchMaxTokens: z.union([z.natural(), z.const(null)]).default(null),
+  dispatchAgentPreset: z.union([z.string(), z.const(null)]).default(null),
+  dispatchReasoningEffort: z.union([z.string(), z.const(null)]).default(null),
 })
 
 /** Extract plain text from a session-derived message list. */
@@ -56,6 +62,54 @@ function textOfContent(content: unknown): string {
     .filter((b): b is { type: string; text?: string } => !!b && typeof b === 'object' && (b as { type?: string }).type === 'text')
     .map((b) => b.text ?? '')
     .join('\n')
+}
+
+/**
+ * Minimal structural view of `ctx.workspaceRegistry` (dsh-workspace). Kept
+ * local so the plugin never hard-depends on the registry package: when it is
+ * absent, sessions simply stay ungrouped.
+ */
+interface WorkspaceRegistryLike {
+  create(path: string, title?: string): Promise<{ id: string; attachSession(sessionId: string): Promise<void> }>
+  delete(id: string): Promise<boolean>
+}
+
+/**
+ * Tracks the workspace records this plugin registered (one per task worktree,
+ * plus the board repo for discussion sessions) so they can be removed again
+ * when the underlying directory is destroyed — otherwise the GUI would keep
+ * showing stale “missing-dir” workspaces.
+ */
+function createWorkspaceTracker(ctx: Context, logger: ReturnType<Context['logger']>) {
+  const byPath = new Map<string, string>()
+  const registry = (): WorkspaceRegistryLike | undefined => ctx.get('workspaceRegistry') as WorkspaceRegistryLike | undefined
+  return {
+    byPath,
+    /** Register `path` as a workspace (idempotent) and attach a session to it. */
+    async attach(path: string, title: string, sessionId: string): Promise<void> {
+      const reg = registry()
+      if (!reg) return
+      try {
+        const ws = await reg.create(path, title)
+        byPath.set(path, ws.id)
+        if (sessionId) await ws.attachSession(sessionId)
+      } catch (error) {
+        logger.warn('workspace attach failed for ' + path + ': ' + (error instanceof Error ? error.message : String(error)))
+      }
+    },
+    /** Remove the workspace record for a destroyed directory, if we created it. */
+    async remove(path: string): Promise<void> {
+      const reg = registry()
+      const id = byPath.get(path)
+      if (!reg || !id) return
+      try {
+        await reg.delete(id)
+      } catch (error) {
+        logger.warn('workspace removal failed for ' + path + ': ' + (error instanceof Error ? error.message : String(error)))
+      }
+      byPath.delete(path)
+    },
+  }
 }
 
 /**
@@ -85,12 +139,18 @@ export async function apply(ctx: Context, config: Config) {
   // ---- dispatch runner + scheduler ----
   // The runner feeds session activity into the scheduler's heartbeat log
   // signal; the scheduler is built just below, so the seam is a holder.
+  const defaultModelSelection = (ctx.get('agentDefaultModel') as { currentSelection(): { provider?: string; model?: string; reasoningEffort?: string } } | undefined)?.currentSelection?.()
   let reportActivity: ((options: import('./scheduler.js').DispatchOptions, lines: string[]) => void) | null = null
+  // Req 1: dispatched/discussion sessions land in a workspace, never “ungrouped”.
+  const workspaceTracker = createWorkspaceTracker(ctx, logger)
   const runner = new DshAgentRunner(ctx, {
-    provider: config.dispatchProvider ?? undefined,
-    model: config.dispatchModel ?? undefined,
+    provider: config.dispatchProvider ?? defaultModelSelection?.provider,
+    model: config.dispatchModel ?? defaultModelSelection?.model,
     maxTokens: config.dispatchMaxTokens ?? undefined,
+    agentPreset: config.dispatchAgentPreset ?? undefined,
+    reasoningEffort: config.dispatchReasoningEffort ?? defaultModelSelection?.reasoningEffort,
     onLog: (options, lines) => reportActivity?.(options, lines),
+    onSessionWorkspace: (path, title, sessionId) => workspaceTracker.attach(path, title, sessionId),
   })
   const scheduler = new SchedulerService(store, gitService, runner, {
     maxConcurrent: config.maxConcurrent,
@@ -110,14 +170,16 @@ export async function apply(ctx: Context, config: Config) {
       publishPing?.()
       rpc.publish({ type: 'task_started', payload: { taskId } })
     },
+    // stale workspace records are dropped when their worktree directory dies
+    onWorktreeRemoved: (path) => void workspaceTracker.remove(path),
   })
   ctx.effect(() => () => { void scheduler.dispose() })
   reportActivity = (options, lines) => scheduler.reportActivity(options.task.id, options.attempt.id, lines)
 
   // ---- LLM completion seam (parse_conversation, DC-01) ----
   const complete = async (system: string, user: string, agent?: Agent): Promise<string> => {
-    let provider = agent?.options.provider ?? config.dispatchProvider ?? undefined
-    let model = agent?.options.model ?? config.dispatchModel ?? undefined
+    let provider = agent?.options.provider ?? config.dispatchProvider ?? defaultModelSelection?.provider
+    let model = agent?.options.model ?? config.dispatchModel ?? defaultModelSelection?.model
     if (!provider || !model) {
       const first = ctx.llm.listProviders()[0]
       if (!first) throw new Error('no LLM provider registered; cannot parse conversation')
@@ -144,6 +206,60 @@ export async function apply(ctx: Context, config: Config) {
     }
   }
 
+  // ---- dispatch catalog for the UI (presets/models/efforts) ----
+  const getDispatchCatalog = async () => {
+    const defaultModel = ctx.get('agentDefaultModel') as { currentSelection(): { provider?: string; model?: string; reasoningEffort?: string } } | undefined
+    const agentPresets = ctx.get('agentPresets') as { defaultId: string; list(): Promise<Array<{ id: string; name?: string; description?: string; broken?: string }>> } | undefined
+    const defaults = defaultModel?.currentSelection?.() ?? {}
+    const defaultPreset = agentPresets?.defaultId
+    const presets = agentPresets ? (await agentPresets.list()).map((p) => ({ id: p.id, name: p.name ?? p.id, description: p.description, broken: p.broken })) : []
+    const providers = await Promise.all(ctx.llm.listProviders().map(async (provider) => {
+      let models: Array<{ id: string; name: string; reasoningEfforts?: Array<{ id: string; name: string; description?: string }>; defaultEffort?: string }> = []
+      try {
+        const infos = await ctx.llm.listModels(provider.id)
+        models = await Promise.all(infos.map(async (info) => {
+          const model: { id: string; name: string; reasoningEfforts?: Array<{ id: string; name: string; description?: string }>; defaultEffort?: string } = { id: info.id, name: info.name }
+          try {
+            const resolved = await ctx.llm.resolveModelInfo(provider.id, info.id)
+            if (resolved.reasoning) {
+              model.reasoningEfforts = resolved.reasoning.efforts.map((e) => ({ id: e.id, name: e.name, description: e.description }))
+              if (resolved.reasoning.defaultEffort) model.defaultEffort = resolved.reasoning.defaultEffort
+            }
+          } catch {
+            // model-level reasoning metadata is advisory
+          }
+          return model
+        }))
+      } catch {
+        // provider model listing is advisory
+      }
+      // Keep the current session's selection visible even when the adapter does
+      // not advertise it (catalog membership is advisory).
+      if (provider.id === defaults.provider && defaults.model && !models.some((m) => m.id === defaults.model)) {
+        models.push({ id: defaults.model, name: defaults.model })
+      }
+      if (provider.id === defaults.provider && defaults.model && defaults.reasoningEffort) {
+        const current = models.find((m) => m.id === defaults.model)
+        if (current && !current.reasoningEfforts?.some((e) => e.id === defaults.reasoningEffort)) {
+          current.reasoningEfforts = [...(current.reasoningEfforts ?? []), { id: defaults.reasoningEffort, name: defaults.reasoningEffort }]
+          if (!current.defaultEffort) current.defaultEffort = defaults.reasoningEffort
+        }
+      }
+      return { id: provider.id, name: provider.name, models }
+    }))
+    return {
+      presets,
+      providers,
+      defaults: {
+        mode: (defaultPreset ? 'agent' : 'api') as 'agent' | 'api',
+        agentPreset: defaultPreset,
+        provider: defaults.provider,
+        model: defaults.model,
+        reasoningEffort: defaults.reasoningEffort,
+      },
+    }
+  }
+
   // ---- business facade ----
   const service = new KanbanService({
     store,
@@ -152,7 +268,70 @@ export async function apply(ctx: Context, config: Config) {
     complete: (system, user, agent) => complete(system, user, agent as Agent | undefined),
     readSessionTranscript,
     notify: (title, message, kind = 'info') => rpc.publish({ type: 'toast', payload: { kind, title, message } }),
+    getDispatchCatalog,
+    // Req 3: task-scoped refinement conversations, context = the card only.
+    startDiscussionSession: (task, board) => runner.spawnDiscussion({ task, board }),
+    // Req 1: sessions always land in a workspace; stale records are removed
+    // when their worktree directory is destroyed.
+    onSessionWorkspace: (path, title, sessionId) => workspaceTracker.attach(path, title, sessionId),
+    onWorktreeRemoved: (path) => void workspaceTracker.remove(path),
   })
+
+  // ---- startup self-heal (worktree sweep) ----
+  // Task worktrees live only while a run is active or a card sits in review.
+  // After a restart no agent session survives, so any leftover herness-task-*
+  // worktree whose card is not in review is dead weight: destroy what is
+  // provably disposable (no commits beyond main, no uncommitted changes),
+  // drop the durable workspace record for the swept directory, and return
+  // cards that a crash left in 'doing' to todo so they can be re-dispatched.
+  // Resolve lazily — the workspace registry may not be initialized yet at
+  // plugin apply time.
+  const registryNow = () => ctx.get('workspaceRegistry') as
+    | (WorkspaceRegistryLike & { list?(): Array<{ id: string; path: string }> })
+    | undefined
+  void (async () => {
+    for (const board of store.listBoards()) {
+      const worktrees = await gitService.listWorktrees(board.repoPath).catch(() => [])
+      for (const wt of worktrees) {
+        if (!wt.branch.startsWith('herness-task-')) continue
+        const task = store.getTaskOrNull(wt.branch.slice('herness-task-'.length))
+        // a review card keeps its worktree until the human decides (merge/reject/revert)
+        if (task?.columnId === 'review') continue
+        // A crash may have left the card mid-run with a dead attempt: settle
+        // it (doing → todo) so the card is actionable again and the GUI stops
+        // showing it as running.
+        const latest = task?.attempts[task.attempts.length - 1]
+        if (task && latest && (latest.status === 'running' || latest.status === 'pending')) {
+          await store.settleAttempt(task.id, latest.id, { status: 'stopped', summary: 'server restart left the attempt dead; worktree swept' }).catch(() => undefined)
+          await store.recordEvent(task.id, 'recovered', { worktree: wt.path }).catch(() => undefined)
+        }
+        try {
+          // only clean stale slots are destroyed — agent work is never dropped
+          if (await gitService.branchAheadOf(board.repoPath, board.mainBranch, wt.branch)) {
+            logger.warn('kept stale worktree with commits on ' + wt.branch + ': ' + wt.path)
+            continue
+          }
+          await gitService.removeWorktree(board.repoPath, wt.path, wt.branch, false)
+        } catch (error) {
+          logger.warn('kept stale worktree ' + wt.path + ': ' + (error instanceof Error ? error.message : String(error)))
+          continue
+        }
+        const registry = registryNow()
+        if (registry) {
+          for (const ws of registry.list?.() ?? []) {
+            if (ws.path === wt.path) {
+              try {
+                await registry.delete(ws.id)
+              } catch {
+                // best-effort — a stale workspace record is cosmetic
+              }
+            }
+          }
+        }
+        logger.info('swept stale task worktree ' + wt.path + ' (' + wt.branch + ')')
+      }
+    }
+  })()
 
   // ---- agent tools (DS-01) + skill (DS-02) ----
   const toolDisposers = registerTools(ctx, service)

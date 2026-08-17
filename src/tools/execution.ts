@@ -20,16 +20,29 @@ const attemptOutput = {
 export function registerExecutionTools(ctx: { tools: { register(definition: unknown): () => void } }, service: KanbanService) {
   ctx.tools.register(defineTool({
     name: 'herness_kanban_dispatch_task',
-    description: 'Dispatch a todo task to a DSH agent for execution. The card moves to doing, gets its own Git worktree and branch (herness-task-<id>), and runs with the user\'s model config. Up to 5 tasks run in parallel; extra dispatches queue. On success the card moves to review; on failure it returns to todo with the error summary (AE-01..AE-04).',
+    description: 'Dispatch a todo task to a DSH agent for execution. The card moves to doing, gets its own Git worktree and branch (herness-task-<id>), and runs with the user\'s model config. Only cards in the todo column can be dispatched (Req 2). Up to 5 tasks run in parallel; extra dispatches queue. On success the card moves to review; on failure it returns to todo with the error summary (AE-01..AE-04).',
     parameters: {
-      taskId: { type: 'string', required: true, description: 'Task id to dispatch (must be in todo or doing).' },
+      taskId: { type: 'string', required: true, description: 'Task id to dispatch (must be in todo).' },
+      runner: {
+        type: 'object',
+        additionalProperties: false,
+        description: 'Optional execution options for this dispatch.',
+        properties: {
+          mode: { type: 'string', enum: ['agent', 'api'], description: 'agent = DSH agent with optional preset; api = direct model route without an agent preset.' },
+          agentPreset: { type: 'string', description: 'Agent preset/mode id (standard, code, minimal, cordis, ...).' },
+          provider: { type: 'string', description: 'Provider route override.' },
+          model: { type: 'string', description: 'Model id override.' },
+          reasoningEffort: { type: 'string', description: 'Reasoning/thinking effort override.' },
+          maxTokens: { type: 'number', description: 'Max output tokens override.' },
+        },
+      },
     },
     output: {
       schema: attemptOutput,
       render: (_args, value) => [{ type: 'text', text: 'Dispatched ' + value.taskId + ' (attempt ' + value.attemptId + ') on branch ' + value.branchName }],
     },
     execute: async (args) => {
-      const attempt = await service.dispatch(args.taskId)
+      const attempt = await service.dispatch(String(args.taskId), (args.runner ?? {}) as Parameters<typeof service.dispatch>[1])
       return {
         attemptId: attempt.id,
         taskId: attempt.taskId,
@@ -111,9 +124,9 @@ export function registerExecutionTools(ctx: { tools: { register(definition: unkn
 
   ctx.tools.register(defineTool({
     name: 'herness_kanban_merge_task',
-    description: 'Merge an approved task into the main branch: pending changes on the task branch are committed, the branch merges with --no-ff, the worktree is destroyed, and the card moves to done. ONLY call this after a human explicitly approved the diff (CR-03).',
+    description: 'Merge an approved task into the main branch: pending changes on the task branch are committed, the branch merges with --no-ff, the worktree is destroyed, and the card moves to done. ONLY call this after a human explicitly approved the diff (CR-03). Only cards in review can be merged (Req 2).',
     parameters: {
-      taskId: { type: 'string', required: true, description: 'Task id (normally in review).' },
+      taskId: { type: 'string', required: true, description: 'Task id (must be in review).' },
     },
     output: {
       schema: {
@@ -135,10 +148,35 @@ export function registerExecutionTools(ctx: { tools: { register(definition: unkn
   }))
 
   ctx.tools.register(defineTool({
-    name: 'herness_kanban_revert_task',
-    description: 'Reject a reviewed task: revert its merge on the main branch, destroy the worktree, record the review notes as a comment, and return the card to todo (CR-04).',
+    name: 'herness_kanban_reject_task',
+    description: 'Reject a reviewed task WITHOUT rolling back the merge: destroy the worktree, record the review notes as a comment, and return the card to todo for modification. The merged code stays on main, so the card can accumulate new content and be re-dispatched to continue (CR-04a). This is the ONLY way a review card goes back to todo without touching main (Req 2).',
     parameters: {
-      taskId: { type: 'string', required: true, description: 'Task id (normally in review).' },
+      taskId: { type: 'string', required: true, description: 'Task id (must be in review).' },
+      reason: { type: 'string', required: true, description: 'Review rejection notes; recorded on the card.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          taskId: { type: 'string', required: true },
+          rejected: { type: 'boolean', required: true },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: 'Rejected ' + value.taskId + '; card returned to todo with review notes (merge kept).' }],
+    },
+    execute: async (args) => {
+      const result = await service.rejectTask(args.taskId, args.reason, 'agent')
+      return { taskId: result.task.id, rejected: true }
+    },
+    presentCall: (args) => ({ card: 'generic', title: 'Reject task', kind: 'other', rawInput: { taskId: args.taskId } }),
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'herness_kanban_revert_task',
+    description: 'Reject a reviewed task AND roll it back: revert its merge on the main branch (when merged), destroy the worktree, record the review notes as a comment, and return the card to todo. Use this when the merged changes must be undone; use reject_task instead when the code should stay and the card just needs more work (CR-04).',
+    parameters: {
+      taskId: { type: 'string', required: true, description: 'Task id (must be in review).' },
       reason: { type: 'string', required: true, description: 'Review rejection notes; recorded on the card.' },
     },
     output: {

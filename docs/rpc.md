@@ -54,6 +54,7 @@ Content-Type: application/json
 | `tasks.move` | `{ taskId, columnId }` | `Task` |
 | `tasks.comment` | `{ taskId, content, author?, filePath?, lineNumber? }` | `Comment` |
 | `tasks.updateDescription` | `{ taskId, description, author? }` | `Task` |
+| `tasks.appendDetail` | `{ taskId, content, author? }` | `Task`（追加带时间戳的「📝 补充」小节到描述，不覆盖原内容） |
 
 ### 执行与审查
 
@@ -64,7 +65,8 @@ Content-Type: application/json
 | `review.diff` | `{ taskId }` | `DiffSummary` |
 | `review.diffstat` | `{ taskId }` | 文本 stat |
 | `review.merge` | `{ taskId, author? }` | `{ taskId, commit }` |
-| `review.revert` | `{ taskId, reason, author? }` | `{ taskId, commit }` |
+| `review.reject` | `{ taskId, reason, author? }` | `{ taskId, commit }`（驳回到待办，不回滚代码） |
+| `review.revert` | `{ taskId, reason, author? }` | `{ taskId, commit }`（回滚合并并退回待办） |
 | `parse.tasks` | `{ boardId, text?, sessionId?, threadId?, linkDependencies? }` | `{ created, skippedDuplicates, dependencyLinked, taskIds }` |
 | `state.snapshot` | — | `{ boards, tasks, running, queue }` |
 

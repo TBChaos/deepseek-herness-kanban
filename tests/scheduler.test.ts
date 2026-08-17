@@ -3,7 +3,7 @@
  */
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { GitService } from '../src/git.js'
@@ -64,6 +64,76 @@ describe('SchedulerService', () => {
     }, 5000)
     const t = store.getTask(task.id)
     assert.equal(t.attempts[0]?.error, 'syntax error')
+    // failed attempts destroy their (clean) worktree — no folder accumulation
+    assert.equal(await git.branchExists(dir, 'herness-task-' + task.id), false)
+    assert.equal(existsSync(dir + '-' + task.id), false)
+    await scheduler.dispose()
+  })
+
+  it('destroys the worktree when a running task is stopped (AE-05)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hkb-sched-'))
+    const git = new GitService()
+    await git.ensureRepo(dir, 'main')
+    writeFileSync(join(dir, 'base.txt'), 'x\n')
+    await git.commitAll(dir, 'chore: base')
+
+    const store = new KanbanStore(new MemoryBackend())
+    const board = await store.createBoard({ name: 'demo', repoPath: dir }, 'main')
+    const task = await store.createTask({ boardId: board.id, title: 'stop me' })
+    let releaseStop: (() => void) | undefined
+    const stopped = new Promise<SessionOutcome>((resolve) => { releaseStop = () => resolve({ status: 'stopped', summary: 'user stopped' }) })
+    const runner: AgentRunner = {
+      spawn: async () => ({ sessionId: 's', wait: () => stopped, stop: async () => releaseStop?.() }),
+    }
+    const scheduler = new SchedulerService(store, git, runner)
+
+    await scheduler.dispatch(task.id)
+    await waitFor(() => scheduler.activeCount === 1, 5000)
+    // wait until the session is actually assigned so stop() can reach it
+    await waitFor(() => store.getTask(task.id).attempts[0]?.sessionId === 's', 5000)
+    assert.equal(existsSync(dir + '-' + task.id), true)
+    await scheduler.stop(task.id)
+    await waitFor(() => store.getTask(task.id).columnId === 'todo' && store.getTask(task.id).attempts[0]?.status === 'stopped', 5000)
+    assert.equal(await git.branchExists(dir, 'herness-task-' + task.id), false)
+    assert.equal(existsSync(dir + '-' + task.id), false)
+    await scheduler.dispose()
+  })
+
+  it('destroys the worktree when a queued task is stopped', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hkb-sched-'))
+    const git = new GitService()
+    await git.ensureRepo(dir, 'main')
+    writeFileSync(join(dir, 'base.txt'), 'x\n')
+    await git.commitAll(dir, 'chore: base')
+
+    const store = new KanbanStore(new MemoryBackend())
+    const board = await store.createBoard({ name: 'demo', repoPath: dir }, 'main')
+    const gates: Array<() => void> = []
+    const runner: AgentRunner = {
+      spawn: async () => ({
+        sessionId: 's',
+        wait: () => new Promise<SessionOutcome>((resolve) => gates.push(() => resolve({ status: 'success' }))),
+        stop: async () => {},
+      }),
+    }
+    const scheduler = new SchedulerService(store, git, runner, { maxConcurrent: 1 })
+    const t1 = await store.createTask({ boardId: board.id, title: 'one' })
+    const t2 = await store.createTask({ boardId: board.id, title: 'two' })
+    await scheduler.dispatch(t1.id)
+    await waitFor(() => scheduler.activeCount === 1, 5000)
+    await scheduler.dispatch(t2.id)
+    assert.equal(scheduler.pendingCount, 1)
+    // the worktree is pre-created at dispatch time even for queued tasks
+    assert.equal(existsSync(dir + '-' + t2.id), true)
+
+    await scheduler.stop(t2.id)
+    assert.equal(scheduler.pendingCount, 0)
+    assert.equal(store.getTask(t2.id).attempts[0]?.status, 'stopped')
+    assert.equal(await git.branchExists(dir, 'herness-task-' + t2.id), false)
+    assert.equal(existsSync(dir + '-' + t2.id), false)
+
+    gates.shift()?.()
+    await waitFor(() => scheduler.activeCount === 0, 5000)
     await scheduler.dispose()
   })
 

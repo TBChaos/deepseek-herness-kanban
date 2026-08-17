@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState, useSyncExternalStore } fro
 import {
   COLUMN_META, PRIORITY_BADGE, call, dismissToast, fmtTime, getError, getSnapshot, getToasts, isConnected,
   refresh, rpc, subscribe, subscribeToasts, taskBadges, type Board, type ColumnId, type DiffSummary,
-  type Snapshot, type Task, type Toast,
+  type DispatchCatalog, type DispatchRunnerOptions, type Snapshot, type Task, type Toast,
 } from './api'
 import { BOARD_CSS } from './styles'
 
@@ -122,11 +122,26 @@ export function KanbanOverlay() {
 function BoardHeader({ snapshot }: { snapshot: Snapshot }) {
   const boardId = useSyncExternalStore(subscribeBoard, getCurrentBoardId, getCurrentBoardId)
   const [adding, setAdding] = useState(false)
+  const [deleting, setDeleting] = useState(false)
   const error = useError()
   const loading = useLoading()
+  const board = snapshot.boards.find((b) => b.id === boardId) ?? null
   useEffect(() => {
     if (!boardId && snapshot.boards[0]) setCurrentBoardId(snapshot.boards[0].id)
   }, [snapshot.boards, boardId])
+  const removeBoard = async () => {
+    if (!board) return
+    if (!confirm('删除项目「' + board.name + '」？\n将删除该项目下的所有任务卡片与执行记录，且不可恢复。\n（不会删除 Git 仓库本身）')) return
+    setDeleting(true)
+    try {
+      await call('boards.delete', { boardId: board.id })
+      setCurrentBoardId(null)
+    } catch (err) {
+      alert(err instanceof Error ? err.message : String(err))
+    } finally {
+      setDeleting(false)
+    }
+  }
   return React.createElement('div', { className: 'hkb-header' },
     React.createElement('h1', null, '📋 看板'),
     React.createElement('select', {
@@ -137,12 +152,13 @@ function BoardHeader({ snapshot }: { snapshot: Snapshot }) {
       snapshot.boards.map((b) => React.createElement('option', { key: b.id, value: b.id }, b.name)),
     ),
     React.createElement('button', { className: 'hkb-btn', onClick: () => setAdding(true) }, '＋ 添加项目'),
+    board && React.createElement('button', { className: 'hkb-btn danger', disabled: deleting, onClick: () => void removeBoard() }, deleting ? '删除中…' : '🗑 删除项目'),
     React.createElement('button', { className: 'hkb-btn', onClick: () => void refresh() }, loading ? '刷新中…' : '⟳ 刷新'),
     React.createElement('span', { className: 'hkb-muted' }, error ?? (isConnected() ? '' : '未连接')),
     React.createElement('span', { className: 'hkb-spacer' }, null),
     snapshot.queue > 0 && React.createElement('span', { className: 'hkb-badge' }, '排队 ' + snapshot.queue),
     React.createElement('button', { className: 'hkb-btn', onClick: () => setOpen(false) }, '✕ 关闭'),
-    adding && boardId && React.createElement(NewBoardModal, { onClose: () => setAdding(false) }),
+    adding && React.createElement(NewBoardModal, { onClose: () => setAdding(false) }),
   )
 }
 
@@ -175,7 +191,30 @@ function BoardBody({ snapshot }: { snapshot: Snapshot }) {
           e.preventDefault()
           setOverCol(null)
           const id = dragTask ?? e.dataTransfer.getData('text/plain')
-          if (id) void call('tasks.move', { taskId: id, columnId: col })
+          if (id) {
+            const task = tasks.find((t) => t.id === id)
+            if (col === 'doing') {
+              // Dragging into Doing means "start working now" — but Req 2:
+              // only todo cards can be dispatched.
+              if (!task || task.columnId !== 'todo') {
+                alert(task && task.columnId !== 'todo' ? '只有待办（todo）任务可以派发；当前状态 [' + task.columnId + ']' : '任务不存在: ' + id)
+              } else {
+                void call('exec.dispatch', { taskId: id }).catch((err) => alert(err instanceof Error ? err.message : String(err)))
+              }
+            } else if (task && task.columnId === 'review' && col !== 'todo' && col !== 'done') {
+              // Req 2: review has exactly two exits — done (merge) / todo (reject or rollback).
+              alert('审查中的任务只能「审查通过并合并」或「驳回到待办 / 回滚」')
+            } else if (task && task.columnId === 'review') {
+              // Route review exits through their lifecycle entry points.
+              if (col === 'done') {
+                alert('请使用「✅ 审查通过并合并」完成审查中的任务')
+              } else {
+                alert('请使用「↩ 驳回到待办」或「⏪ 回滚」将审查中的任务退回待办')
+              }
+            } else {
+              void call('tasks.move', { taskId: id, columnId: col }).catch((err) => alert(err instanceof Error ? err.message : String(err)))
+            }
+          }
           setDragTask(null)
         },
       },
@@ -316,7 +355,7 @@ function TaskDrawerHost() {
     selectTask(null)
     return null
   }
-  return React.createElement(TaskDrawer, { task: task })
+  return React.createElement(TaskDrawer, { key: task.id, task: task })
 }
 
 function TaskDrawer({ task }: { task: Task }) {
@@ -326,7 +365,13 @@ function TaskDrawer({ task }: { task: Task }) {
   const [comment, setComment] = useState('')
   const [blockReason, setBlockReason] = useState(task.blockReason ?? '')
   const [busy, setBusy] = useState(false)
-  const [rejecting, setRejecting] = useState(false)
+  const [rejecting, setRejecting] = useState<'reject' | 'rollback' | null>(null)
+  const [appending, setAppending] = useState(false)
+  const [catalog, setCatalog] = useState<DispatchCatalog | null>(null)
+  const [provider, setProvider] = useState('')
+  const [model, setModel] = useState('')
+  const [reasoningEffort, setReasoningEffort] = useState('')
+  const [catalogError, setCatalogError] = useState<string | null>(null)
   const last = task.attempts[task.attempts.length - 1]
   const running = last && (last.status === 'running' || last.status === 'pending')
   useEffect(() => {
@@ -334,6 +379,26 @@ function TaskDrawer({ task }: { task: Task }) {
     setDescription(task.description)
     setBlockReason(task.blockReason ?? '')
   }, [task.id, task.title, task.description, task.blockReason])
+
+  useEffect(() => {
+    let alive = true
+    rpc<DispatchCatalog>('dispatch.catalog')
+      .then((catalog) => {
+        if (!alive) return
+        setCatalog(catalog)
+        const d = catalog.defaults
+        const nextProvider = d.provider ?? catalog.providers[0]?.id ?? ''
+        const providerObj = catalog.providers.find((p) => p.id === nextProvider)
+        const nextModel = d.model ?? providerObj?.models[0]?.id ?? ''
+        const modelObj = providerObj?.models.find((m) => m.id === nextModel)
+        setProvider(nextProvider)
+        setModel(nextModel)
+        setReasoningEffort(d.reasoningEffort ?? modelObj?.defaultEffort ?? modelObj?.reasoningEfforts?.[0]?.id ?? '')
+        setCatalogError(null)
+      })
+      .catch((err) => setCatalogError(err instanceof Error ? err.message : String(err)))
+    return () => { alive = false }
+  }, [])
   const save = async () => {
     setBusy(true)
     try { await call('tasks.update', { taskId: task.id, title, description }) }
@@ -349,6 +414,47 @@ function TaskDrawer({ task }: { task: Task }) {
     if (!confirm('删除任务 ' + task.title + ' ？')) return
     await call('tasks.delete', { taskId: task.id })
     selectTask(null)
+  }
+  const [discussing, setDiscussing] = useState(false)
+  const [discussion, setDiscussion] = useState<{ taskId: string; sessionId: string } | null>(null)
+  const startDiscussion = async () => {
+    setDiscussing(true)
+    try {
+      const result = await rpc<{ taskId: string; sessionId: string }>('task.discuss', { taskId: task.id })
+      setDiscussion(result)
+    } catch (err) {
+      alert(err instanceof Error ? err.message : String(err))
+    } finally {
+      setDiscussing(false)
+    }
+  }
+  const discussionSessions = task.events.filter((ev) => ev.type === 'discussion_started').map((ev) => String(ev.data?.sessionId ?? '')).filter(Boolean)
+
+  const providerObj = catalog?.providers.find((p) => p.id === provider)
+  const modelObj = providerObj?.models.find((m) => m.id === model)
+  const efforts = modelObj?.reasoningEfforts ?? []
+
+  const changeModel = (nextModel: string) => {
+    setModel(nextModel)
+    const nextModelObj = providerObj?.models.find((m) => m.id === nextModel)
+    setReasoningEffort(nextModelObj?.defaultEffort ?? nextModelObj?.reasoningEfforts?.[0]?.id ?? '')
+  }
+
+  const dispatch = async () => {
+    setBusy(true)
+    const runner: DispatchRunnerOptions = {
+      mode: 'api',
+      ...(provider ? { provider } : {}),
+      ...(model ? { model } : {}),
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+    }
+    try {
+      await call('exec.dispatch', { taskId: task.id, runner })
+    } catch (err) {
+      alert(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
   }
   const TABS = [
     ['detail', '详情'],
@@ -374,13 +480,56 @@ function TaskDrawer({ task }: { task: Task }) {
         tab === 'detail' && React.createElement(React.Fragment, null,
           React.createElement('div', { className: 'hkb-row' },
             running && React.createElement('button', { className: 'hkb-btn danger', onClick: () => void call('exec.stop', { taskId: task.id }) }, '⏹ 停止运行'),
-            !running && React.createElement('button', { className: 'hkb-btn primary', onClick: () => void call('exec.dispatch', { taskId: task.id }) }, '▶ 派发给 DSH Agent'),
+            // Req 2: only todo cards can be dispatched.
+            task.columnId === 'todo' && !running && React.createElement('button', { className: 'hkb-btn primary', disabled: busy || !provider || !model, onClick: () => void dispatch() }, busy ? '派发中…' : '▶ 派发（API）'),
             task.columnId === 'review' && React.createElement('button', { className: 'hkb-btn success', onClick: () => void call('review.merge', { taskId: task.id, author: 'user' }) }, '✅ 审查通过并合并'),
-            task.columnId === 'review' && React.createElement('button', { className: 'hkb-btn danger', onClick: () => setRejecting(true) }, '❌ 驳回并回滚'),
+            task.columnId === 'review' && React.createElement('button', { className: 'hkb-btn danger', title: '驳回到待办，保留 main 上的合并代码，可继续补充内容后重新派发', onClick: () => setRejecting('reject') }, '↩ 驳回到待办'),
+            task.columnId === 'review' && React.createElement('button', { className: 'hkb-btn danger', title: '撤销 main 上的合并提交并退回待办', onClick: () => setRejecting('rollback') }, '⏪ 回滚'),
+            React.createElement('button', { className: 'hkb-btn', onClick: () => setAppending(true) }, '✏️ 补充细节'),
             React.createElement('button', { className: 'hkb-btn', onClick: () => void remove() }, '🗑 删除'),
             React.createElement('span', { className: 'hkb-spacer' }, null),
           ),
-          rejecting && React.createElement(RejectPanel, { task: task, onClose: () => setRejecting(false) }),
+          // Req 3: refine requirements in a task-scoped conversation (todo stage).
+          task.columnId === 'todo' && !running && React.createElement('div', { className: 'hkb-row' },
+            React.createElement('button', { className: 'hkb-btn', disabled: discussing, onClick: () => void startDiscussion() }, discussing ? '开启中…' : '💬 细化需求（任务对话）'),
+            (discussion || discussionSessions.length > 0) && React.createElement('span', { className: 'hkb-muted', style: { fontSize: 12 } },
+              (discussion ? '已创建会话 ' + discussion.sessionId : '') +
+              (discussion ? '；' : '') +
+              (discussionSessions.length > 0 ? '历史会话: ' + discussionSessions.join(', ') : '') +
+              ' — 在左侧工作区中找到该会话继续对话，上下文仅包含本任务',
+            ),
+          ),
+          rejecting && React.createElement(RejectPanel, { task: task, mode: rejecting, onClose: () => setRejecting(null) }),
+          appending && React.createElement(AppendDetailModal, { task: task, onClose: () => setAppending(false) }),
+          task.columnId === 'todo' && React.createElement(React.Fragment, null,
+            React.createElement('div', { className: 'hkb-field' },
+              React.createElement('label', null, '模式'),
+              React.createElement('select', { value: 'api', disabled: true },
+                React.createElement('option', { value: 'api' }, 'API'),
+              ),
+            ),
+            catalogError && React.createElement('div', { className: 'hkb-muted', style: { color: '#f87171' } }, catalogError),
+            React.createElement('div', { className: 'hkb-field' },
+              React.createElement('label', null, '模型'),
+              React.createElement('select', {
+                value: model,
+                onChange: (e: React.ChangeEvent<HTMLSelectElement>) => changeModel(e.target.value),
+              },
+                (providerObj?.models ?? []).map((m) => React.createElement('option', { key: m.id, value: m.id }, m.name)),
+                (providerObj?.models ?? []).length === 0 && React.createElement('option', { value: '' }, '（无可用模型）'),
+              ),
+            ),
+            React.createElement('div', { className: 'hkb-field' },
+              React.createElement('label', null, '思考强度'),
+              React.createElement('select', {
+                value: reasoningEffort,
+                onChange: (e: React.ChangeEvent<HTMLSelectElement>) => setReasoningEffort(e.target.value),
+              },
+                efforts.map((e) => React.createElement('option', { key: e.id, value: e.id }, e.name)),
+                efforts.length === 0 && React.createElement('option', { value: '' }, '（跟随模型默认）'),
+              ),
+            ),
+          ),
           React.createElement('div', { className: 'hkb-field' },
             React.createElement('label', null, '标题'),
             React.createElement('input', { value: title, onChange: (e) => setTitle(e.target.value) }),
@@ -437,13 +586,57 @@ function summarizeEventData(data: Record<string, unknown>): string {
   return interesting.join(' ')
 }
 
-function RejectPanel({ task, onClose }: { task: Task; onClose: () => void }) {
+function RejectPanel({ task, mode, onClose }: { task: Task; mode: 'reject' | 'rollback'; onClose: () => void }) {
   const [reason, setReason] = useState('')
+  const [extra, setExtra] = useState('')
   const [busy, setBusy] = useState(false)
   const submit = async () => {
     setBusy(true)
     try {
-      await call('review.revert', { taskId: task.id, reason: reason.trim() || '未说明原因', author: 'user' })
+      // Optional: append new requirements to the card description first, so a
+      // rejected card carries the review's follow-up content straight into todo.
+      if (extra.trim()) {
+        await call('tasks.appendDetail', { taskId: task.id, content: extra.trim(), author: 'user' })
+      }
+      if (mode === 'rollback') {
+        await call('review.revert', { taskId: task.id, reason: reason.trim() || '未说明原因', author: 'user' })
+      } else {
+        await call('review.reject', { taskId: task.id, reason: reason.trim() || '未说明原因', author: 'user' })
+      }
+      onClose()
+    } catch (err) {
+      alert(err instanceof Error ? err.message : String(err))
+    } finally { setBusy(false) }
+  }
+  const rollback = mode === 'rollback'
+  return React.createElement('div', { className: 'hkb-modal-bg', onClick: onClose },
+    React.createElement('div', { className: 'hkb-modal', onClick: (e: React.MouseEvent) => e.stopPropagation() },
+      React.createElement('h3', null, rollback ? '回滚并退回待办' : '驳回到待办'),
+      React.createElement('div', { className: 'hkb-field' },
+        React.createElement('label', null, '审查意见（记录在卡片上）'),
+        React.createElement('textarea', { value: reason, onChange: (e: React.ChangeEvent<HTMLTextAreaElement>) => setReason(e.target.value), autoFocus: true }),
+      ),
+      React.createElement('div', { className: 'hkb-field' },
+        React.createElement('label', null, '补充的新要求（可选，直接追加到卡片描述）'),
+        React.createElement('textarea', { value: extra, onChange: (e: React.ChangeEvent<HTMLTextAreaElement>) => setExtra(e.target.value), placeholder: '例如：需要补充支持 X 场景……' }),
+      ),
+      React.createElement('div', { className: 'hkb-row' },
+        React.createElement('button', { className: 'hkb-btn danger', disabled: busy, onClick: () => void submit() }, busy ? (rollback ? '回滚中…' : '处理中…') : (rollback ? '⏪ 确认回滚' : '↩ 确认驳回')),
+        React.createElement('button', { className: 'hkb-btn', onClick: onClose }, '取消'),
+      ),
+    ),
+  )
+}
+
+/** ✏️ 补充细节 — append a dated section to the card description without leaving the board. */
+function AppendDetailModal({ task, onClose }: { task: Task; onClose: () => void }) {
+  const [content, setContent] = useState('')
+  const [busy, setBusy] = useState(false)
+  const submit = async () => {
+    if (!content.trim()) return
+    setBusy(true)
+    try {
+      await call('tasks.appendDetail', { taskId: task.id, content: content.trim(), author: 'user' })
       onClose()
     } catch (err) {
       alert(err instanceof Error ? err.message : String(err))
@@ -451,13 +644,13 @@ function RejectPanel({ task, onClose }: { task: Task; onClose: () => void }) {
   }
   return React.createElement('div', { className: 'hkb-modal-bg', onClick: onClose },
     React.createElement('div', { className: 'hkb-modal', onClick: (e: React.MouseEvent) => e.stopPropagation() },
-      React.createElement('h3', null, '驳回并回滚'),
+      React.createElement('h3', null, '✏️ 补充细节'),
       React.createElement('div', { className: 'hkb-field' },
-        React.createElement('label', null, '审查意见（记录在卡片上）'),
-        React.createElement('textarea', { value: reason, onChange: (e: React.ChangeEvent<HTMLTextAreaElement>) => setReason(e.target.value), autoFocus: true }),
+        React.createElement('label', null, '补充内容（Markdown，追加到卡片描述，不覆盖原有内容）'),
+        React.createElement('textarea', { value: content, onChange: (e: React.ChangeEvent<HTMLTextAreaElement>) => setContent(e.target.value), autoFocus: true, style: { minHeight: 120 }, placeholder: '例如：补充验收标准、新的需求细节……' }),
       ),
       React.createElement('div', { className: 'hkb-row' },
-        React.createElement('button', { className: 'hkb-btn danger', disabled: busy, onClick: () => void submit() }, busy ? '回滚中…' : '❌ 确认驳回'),
+        React.createElement('button', { className: 'hkb-btn primary', disabled: busy || !content.trim(), onClick: () => void submit() }, busy ? '追加中…' : '追加到描述'),
         React.createElement('button', { className: 'hkb-btn', onClick: onClose }, '取消'),
       ),
     ),
@@ -523,7 +716,8 @@ function DiffPanel({ task }: { task: Task }) {
       React.createElement('span', { className: 'hkb-badge', style: { color: '#fca5a5' } }, '-' + summary.deletions),
       React.createElement('span', { className: 'hkb-spacer' }, null),
       React.createElement('button', { className: 'hkb-btn success', onClick: () => void call('review.merge', { taskId: task.id, author: 'user' }) }, '✅ 审查通过并合并'),
-      React.createElement('button', { className: 'hkb-btn danger', onClick: () => { const reason = prompt('驳回原因：'); if (reason !== null) void call('review.revert', { taskId: task.id, reason, author: 'user' }) } }, '❌ 驳回并回滚'),
+      React.createElement('button', { className: 'hkb-btn danger', title: '驳回到待办，保留 main 上的合并代码', onClick: () => { const reason = prompt('驳回原因（驳回到待办，不回滚代码）：'); if (reason !== null) void call('review.reject', { taskId: task.id, reason, author: 'user' }) } }, '↩ 驳回到待办'),
+      React.createElement('button', { className: 'hkb-btn danger', title: '撤销 main 上的合并提交并退回待办', onClick: () => { const reason = prompt('回滚原因（撤销合并并退回待办）：'); if (reason !== null) void call('review.revert', { taskId: task.id, reason, author: 'user' }) } }, '⏪ 回滚'),
     ),
     React.createElement('div', { style: { display: 'flex', gap: 10, minHeight: 0 } },
       React.createElement('div', { style: { width: 230, flexShrink: 0, maxHeight: 46 * 6, overflowY: 'auto' } },

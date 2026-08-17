@@ -10,12 +10,12 @@
 ## 安装
 
 ```sh
-# 从 npm（发布后）
+# 从 npm 安装
 dsh plugin --profile web add deepseek-herness-kanban
 
 # 从本地仓库 / tarball
 dsh plugin --profile web add link:/path/to/deepseek-herness-kanban
-dsh plugin --profile web add ./deepseek-herness-kanban-0.1.0.tgz
+dsh plugin --profile web add ./deepseek-herness-kanban-<version>.tgz
 ```
 
 安装完成后插件会自动加入 profile 的 `dsh.profile.bundles`，启动时作为一层
@@ -58,7 +58,9 @@ AI 调用 `herness_kanban_parse_conversation` 分析对话，批量创建任务�
 2. 左侧文件树 + 右侧逐行高亮 Diff。
 3. **✅ 审查通过并合并** → `git merge --no-ff` 合并回主分支，销毁 worktree，
    卡片移入「已完成」。
-4. **❌ 驳回并回滚** → `git revert` 回滚，审查意见记录在卡片评论里，
+4. **↩ 驳回到待办** → 卡片回「待办」，main 上的合并代码**保留**，审查意见
+   记录在卡片评论里；可继续「✏️ 补充细节」追加新要求后重新派发。
+5. **⏪ 回滚** → `git revert` 撤销 main 上的合并，审查意见记录在卡片评论里，
    卡片回到「待办」。
 
 ## 心跳与超时

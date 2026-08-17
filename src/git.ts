@@ -7,7 +7,7 @@
  */
 import { execFile, execFileSync } from 'node:child_process'
 import { promisify } from 'node:util'
-import { existsSync, mkdirSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { branchNameFor, worktreePathFor } from './ids.js'
 import type { Board, DiffSummary, FileDiff, Task } from './types.js'
@@ -161,6 +161,12 @@ export class GitService {
     }
   }
 
+  /** True when `branch` has commits not reachable from `base` (i.e. real work). */
+  async branchAheadOf(repoPath: string, base: string, branch: string): Promise<boolean> {
+    const count = (await run(repoPath, ['rev-list', '--count', base + '..' + branch]).catch(() => '')).trim()
+    return count !== '' && count !== '0'
+  }
+
   async commitAll(path: string, message: string, author = 'herness-kanban'): Promise<string> {
     await run(path, ['add', '-A'])
     const status = await this.porcelainStatus(path)
@@ -203,12 +209,53 @@ export class GitService {
     const path = worktreePathFor(board, task)
     const branch = branchNameFor(task)
     if (existsSync(path)) {
-      throw new GitError('worktree path already exists: ' + path, 'WORKTREE_EXISTS')
+      await this.reclaimWorktreeSlot(board, path)
     }
     await this.syncMain(board.repoPath, board.mainBranch)
     // New branch starting from the tip of main (CR-07: auto rebase before execution).
     await run(board.repoPath, ['worktree', 'add', '-b', branch, path, 'refs/heads/' + board.mainBranch])
     return { branch, path }
+  }
+
+  /**
+   * Recover a worktree slot left behind by a previous attempt of the same
+   * task (crashed server, interrupted run) so a re-dispatch can start fresh.
+   * Only stale plugin-owned worktrees without work are reclaimed:
+   *
+   * - a registered `herness-task-*` worktree is removed when its branch has
+   *   no commits beyond main and no uncommitted changes (removeWorktree
+   *   throws WORKTREE_DIRTY otherwise);
+   * - an unregistered leftover directory is deleted only when it is empty
+   *   or holds nothing but a bare `.git` gitdir pointer.
+   *
+   * Anything else — foreign worktrees, committed or dirty work — is kept
+   * and reported with WORKTREE_EXISTS so no agent work is ever destroyed.
+   */
+  private async reclaimWorktreeSlot(board: Board, path: string): Promise<void> {
+    const registered = (await this.listWorktrees(board.repoPath)).find((wt) => wt.path === path)
+    if (registered && registered.branch.startsWith('herness-task-')) {
+      const ahead = (await run(board.repoPath, ['rev-list', '--count', board.mainBranch + '..' + registered.branch]).catch(() => '')).trim()
+      if (ahead && ahead !== '0') {
+        throw new GitError(
+          'worktree from a previous attempt still holds commits on ' + registered.branch + '; review or remove it before re-dispatching: ' + path,
+          'WORKTREE_EXISTS',
+        )
+      }
+      await this.removeWorktree(board.repoPath, path, registered.branch, false)
+      return
+    }
+    let entries: string[] = []
+    try {
+      entries = readdirSync(path)
+    } catch {
+      return // disappeared between the check and now — the slot is free
+    }
+    const leftovers = entries.filter((entry) => entry !== '.git')
+    if (leftovers.length > 0) {
+      throw new GitError('worktree path already exists: ' + path, 'WORKTREE_EXISTS')
+    }
+    rmSync(path, { recursive: true, force: true })
+    await run(board.repoPath, ['worktree', 'prune']).catch(() => undefined)
   }
 
   async listWorktrees(repoPath: string): Promise<WorktreeInfo[]> {
@@ -386,8 +433,13 @@ export class GitService {
     }
   }
 
-  /** Revert a merged task commit (CR-04). */
-  async revert(repoPath: string, mainBranch: string, taskBranch: string, taskId: string): Promise<string> {
+  /**
+   * Revert a merged task commit (CR-04). When the task branch was never
+   * merged into main (no `Merge task <id>` commit exists), main is untouched
+   * and nothing needs reverting — the caller still destroys the worktree and
+   * branch, and the card returns to todo.
+   */
+  async revert(repoPath: string, mainBranch: string, taskBranch: string, taskId: string): Promise<string | undefined> {
     const current = await this.currentBranch(repoPath)
     try {
       await run(repoPath, ['checkout', mainBranch])
@@ -399,9 +451,7 @@ export class GitService {
       } catch {
         mergeCommit = ''
       }
-      if (!mergeCommit) {
-        mergeCommit = (await run(repoPath, ['log', '-1', '--format=%H', taskBranch])).trim()
-      }
+      if (!mergeCommit) return undefined
       await run(repoPath, ['revert', '--no-edit', '-m', '1', mergeCommit], 120_000)
       const out = await run(repoPath, ['rev-parse', 'HEAD'])
       return out.trim()

@@ -2,6 +2,9 @@
 
 > DeepSeek Harness 的 Vibe Kanban：4 列看板 + Git Worktree 隔离执行 + 强制代码审查 + 对话上下文沉淀。
 
+[![npm](https://img.shields.io/npm/v/deepseek-herness-kanban)](https://www.npmjs.com/package/deepseek-herness-kanban)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+
 [English](./README.md) · [文档](./docs/README.md) · [MIT](./LICENSE)
 
 ## 核心能力
@@ -24,7 +27,7 @@
 ```
 📋 待办 ──派发──▶ ▶️ 进行中 ──成功──▶ 👀 审查中 ──通过──▶ ✅ 已完成
                     │  ▲                    │
-                   失败                   驳回 + 回滚
+                   失败             驳回（保留代码）/ 回滚
                     └──────────────────────┴──▶ 📋 待办 + 摘要
 ```
 
@@ -32,19 +35,21 @@
 2. **创建卡片**：手动创建，或对 AI 说“把刚才讨论的拆解成看板任务”。
 3. **派发执行**：每张卡片在独立 worktree（分支 `herness-task-<id>`）中由
    DSH Agent 执行，默认 5 个并行。
-4. **代码审查**：逐行 Diff，一键合并或回滚——AI 的任何改动都必须人工批准
-   才能进入主分支。
-5. **上下文沉淀**：评论、描述版本、执行记录、事件时间线永远留在卡片上。
+4. **代码审查**：逐行 Diff，一键合并；驳回可分「驳回到待办」（保留代码，
+   继续补充内容后重新派发）与「回滚」（撤销 main 上的合并）——AI 的任何
+   改动都必须人工批准才能进入主分支。
+5. **上下文沉淀**：评论、描述版本、执行记录、事件时间线永远留在卡片上；
+   想补充细节直接在卡片上点「✏️ 补充细节」，不必回到会话。
 
 ## 安装
 
 ```sh
-# npm（发布后）
+# npm 安装
 dsh plugin --profile web add deepseek-herness-kanban
 
 # 本地 / tarball
 dsh plugin --profile web add link:/path/to/deepseek-herness-kanban
-dsh plugin --profile web add ./deepseek-herness-kanban-0.1.0.tgz
+dsh plugin --profile web add ./deepseek-herness-kanban-<version>.tgz
 ```
 
 然后打开 Web GUI，点击侧边栏 **📋 看板**。
@@ -67,13 +72,14 @@ dsh plugin --profile dev add link:/path/to/deepseek-herness-kanban
 dsh web --profile dev
 ```
 
-## 17 个 Agent 工具
+## 19 个 Agent 工具
 
 看板：`list_boards` / `create_board` / `delete_board`；任务：`list_tasks` /
 `get_task` / `create_task` / `update_task` / `delete_task` / `move_task` /
-`add_comment` / `update_description`；执行：`dispatch_task` / `stop_task` /
-`get_diff` / `merge_task` / `revert_task`；拆解：`parse_conversation` ——
-前缀均为 `herness_kanban_`，详见 [docs/tools.md](./docs/tools.md)。
+`add_comment` / `update_description` / `discuss_task`；执行：
+`dispatch_task` / `stop_task` / `get_diff` / `merge_task` / `reject_task` /
+`revert_task`；拆解：`parse_conversation` —— 前缀均为 `herness_kanban_`，
+详见 [docs/tools.md](./docs/tools.md)。
 
 ## License
 
